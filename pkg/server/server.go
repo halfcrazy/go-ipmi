@@ -27,6 +27,7 @@ import (
 	"github.com/bougou/go-ipmi/pkg/handlers"
 	"github.com/bougou/go-ipmi/pkg/protocol"
 	"github.com/bougou/go-ipmi/pkg/transport"
+	ipmi "github.com/bougou/go-ipmi/pkg/types"
 )
 
 // Payload type aliases from pkg/protocol for readability within this file.
@@ -182,9 +183,55 @@ func (s *Server) handleIPMI(_ context.Context, addr net.Addr, pkt []byte) {
 	if authTypeByte == 0x06 {
 		s.handleRMCPPlus(addr, pkt)
 	} else {
-		// IPMI 1.5 is not yet implemented in the reference server.
-		// Silently drop to avoid confusing the client.
+		s.handleIPMIv15(addr, pkt)
 	}
+}
+
+// handleIPMIv15 provides minimal IPMI 1.5 support for the pre-session phase.
+//
+// Only unauthenticated (AuthType NONE) packets with session ID zero are
+// dispatched — this covers the Get Channel Authentication Capabilities
+// command that clients send before deciding whether to proceed with IPMI
+// 1.5 or upgrade to RMCP+ (IPMI 2.0).
+//
+// Authenticated IPMI 1.5 sessions, Activate Session, Get Session Challenge,
+// and all other IPMI 1.5 stateful operations remain unimplemented.  Packets
+// that do not match the narrow pre-session criteria are silently dropped.
+func (s *Server) handleIPMIv15(addr net.Addr, pkt []byte) {
+	if len(pkt) < 14 {
+		return
+	}
+
+	// Reuse Session15.Unpack to parse the IPMI 1.5 session wrapper.
+	var sess ipmi.Session15
+	if err := sess.Unpack(pkt[4:]); err != nil {
+		return
+	}
+	if sess.SessionHeader15.AuthType != ipmi.AuthTypeNone {
+		return
+	}
+
+	netFn, cmd, data, seq, ok := protocol.ParseIPMIRequest(sess.Payload)
+	if !ok {
+		return
+	}
+
+	ctx := context.Background()
+	hctx := &handlers.HandlerContext{BMC: s.bmc}
+	respData, cc, _ := s.reg.Dispatch(ctx, hctx, netFn, cmd, data)
+
+	ipmiResp := protocol.BuildIPMIResponse(netFn, cmd, seq, uint8(cc), respData)
+
+	// Build IPMI 1.5 response header (AuthType NONE).
+	respHdr := ipmi.SessionHeader15{
+		AuthType:      ipmi.AuthTypeNone,
+		PayloadLength: uint8(len(ipmiResp)),
+	}
+
+	rmcp := []byte{pkt[0], pkt[1], 0xFF, pkt[3]}
+	out := append(rmcp, respHdr.Pack()...)
+	out = append(out, ipmiResp...)
+	_, _ = s.conn.WriteTo(out, addr)
 }
 
 // handleRMCPPlus routes RMCP+ (IPMI 2.0) packets.

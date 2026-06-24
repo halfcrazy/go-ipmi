@@ -22,6 +22,7 @@ const (
 // a session exists); see [HandleOpenSession], [HandleRAKP1], [HandleRAKP3].
 func RegisterSessionHandlers(r *Registry) {
 	r.Register(NetFnAppRequest, CmdGetChannelAuthCapabilities, HandlerFunc(handleGetChannelAuthCaps))
+	r.Register(NetFnAppRequest, CmdGetChannelCipherSuites, HandlerFunc(handleGetChannelCipherSuites))
 	r.Register(NetFnAppRequest, CmdSetSessionPrivilegeLevel, HandlerFunc(handleSetSessionPrivilegeLevel))
 	r.Register(NetFnAppRequest, CmdCloseSession, HandlerFunc(handleCloseSession))
 }
@@ -31,7 +32,8 @@ func RegisterSessionHandlers(r *Registry) {
 // ---------------------------------------------------------------------------
 
 // handleGetChannelAuthCaps implements Get Channel Authentication Capabilities (App 0x38).
-// The server currently advertises IPMI 2.0 only (RAKP-HMAC-SHA1 + AES-CBC-128).
+// Advertises IPMI 1.5 auth types (NONE/MD2/MD5/password/OEM) plus IPMI 2.0/RMCP+
+// support so that both ipmitool and goipmi clients proceed to the RMCP+ handshake.
 func handleGetChannelAuthCaps(_ context.Context, hctx *HandlerContext, req []byte) ([]byte, CompletionCode, error) {
 	if len(req) < 2 {
 		return nil, CodeRequestDataTruncated, nil
@@ -41,17 +43,41 @@ func handleGetChannelAuthCaps(_ context.Context, hctx *HandlerContext, req []byt
 
 	resp := make([]byte, 8)
 	resp[0] = 0x01 // channel number (1 = LAN)
-	resp[1] = 0x00 // auth types supported (none for v2.0-only)
-	resp[2] = 0x22 // bit 5: IPMI 2.0 supported; bit 1: user-level auth disabled allowed
-	resp[3] = 0x00 // per-message auth support flags
+	// resp[1] — auth type support (IPMI spec Table 22-15, byte 3):
+	//   bit 7 = IPMI v2.0 extended capabilities available
+	//   bit 4 = straight password; bit 2 = MD5; bit 1 = MD2; bit 0 = NONE
+	resp[1] = 0x97 // 0b1001_0111: IPMI v2.0 ext + password + MD5 + MD2 + NONE
+	// resp[2] — byte 4 of Table 22-15:
+	//   bit 5 = KgStatus; bit 2 = Non-Null usernames enabled
+	resp[2] = 0x24 // 0b0010_0100
+	// resp[3] — extended capabilities (byte 5):
+	//   bit 1 = IPMI v2.0 connections supported; bit 0 = IPMI v1.5 supported
+	resp[3] = 0x03 // IPMI v2.0 + v1.5 connections
 	resp[4] = 0x00 // OEM ID byte 1
 	resp[5] = 0x00 // OEM ID byte 2
 	resp[6] = 0x00 // OEM ID byte 3
 	resp[7] = 0x00 // OEM auxiliary data
-
-	// Bit 5 of byte 2 = IPMI v2.0/RMCP+ support
-	resp[2] = resp[2] | 0x20
 	return resp, CodeOK, nil
+}
+
+// handleGetChannelCipherSuites implements Get Channel Cipher Suites (App 0x54).
+// Returns a single record for cipher suite 3 (RAKP-HMAC-SHA1 + HMAC-SHA1-96 +
+// AES-CBC-128) — the suite the server actually supports in its RMCP+ handshake.
+func handleGetChannelCipherSuites(_ context.Context, hctx *HandlerContext, req []byte) ([]byte, CompletionCode, error) {
+	if len(req) < 2 {
+		return nil, CodeRequestDataTruncated, nil
+	}
+	// Byte 0: channel number + list index (bits 5:0 = channel, bits 7:6 = reserved)
+	// Byte 1: payload type (0x00 = IPMI)
+	// Response: [channel][cipher suite records...]
+	//
+	// Standard cipher suite record for suite 3:
+	//   0xC0           start-of-record (standard)
+	//   0x03           cipher suite ID 3
+	//   0x01           auth alg  RAKP-HMAC-SHA1   (tag 00b)
+	//   0x41           integ alg HMAC-SHA1-96     (tag 01b)
+	//   0x81           crypt alg AES-CBC-128      (tag 10b)
+	return []byte{0x01, 0xC0, 0x03, 0x01, 0x41, 0x81}, CodeOK, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -132,9 +158,9 @@ func HandleOpenSession(ctx context.Context, b *bmc.BMC, data []byte) ([]byte, er
 	consoleID := binary.LittleEndian.Uint32(data[4:8])
 
 	// Parse algorithm payloads (3 x 8-byte records at offsets 8, 16, 24).
-	authAlg := bmc.AuthAlg(data[11])     // byte 3 of auth payload
-	intAlg := bmc.IntegrityAlg(data[19]) // byte 3 of integrity payload
-	cryptAlg := bmc.CryptAlg(data[27])   // byte 3 of crypt payload
+	authAlg := bmc.AuthAlg(data[12])     // byte 4 of auth payload
+	intAlg := bmc.IntegrityAlg(data[20]) // byte 4 of integrity payload
+	cryptAlg := bmc.CryptAlg(data[28])   // byte 4 of crypt payload
 
 	// Validate algorithm support.  We support RAKP-HMAC-SHA1 (0x01),
 	// HMAC-SHA1-96 (0x01), AES-CBC-128 (0x01) as the reference cipher suite.
@@ -164,33 +190,18 @@ func HandleOpenSession(ctx context.Context, b *bmc.BMC, data []byte) ([]byte, er
 	resp[3] = 0x00 // reserved
 	binary.LittleEndian.PutUint32(resp[4:8], consoleID)
 	binary.LittleEndian.PutUint32(resp[8:12], sess.BMCID)
-	// Auth algorithm payload (8 bytes at offset 12)
-	resp[12] = 0x00 // payload type = auth
-	resp[13] = 0x00
-	resp[14] = 0x00
-	resp[15] = uint8(authAlg)
-	resp[16] = 0x00
-	resp[17] = 0x00
-	resp[18] = 0x00
-	resp[19] = 0x00
-	// Integrity algorithm payload (8 bytes at offset 20)
-	resp[20] = 0x01 // payload type = integrity
-	resp[21] = 0x00
-	resp[22] = 0x00
-	resp[23] = uint8(intAlg)
-	resp[24] = 0x00
-	resp[25] = 0x00
-	resp[26] = 0x00
-	resp[27] = 0x00
-	// Confidentiality algorithm payload (8 bytes at offset 28)
-	resp[28] = 0x02 // payload type = confidentiality
-	resp[29] = 0x00
-	resp[30] = 0x00
-	resp[31] = uint8(cryptAlg)
-	resp[32] = 0x00
-	resp[33] = 0x00
-	resp[34] = 0x00
-	resp[35] = 0x00
+	// Algorithm payloads (3 × 8 bytes).  resp is zero-initialised, so only
+	// the non-zero fields need to be set.
+	//   [PayloadType][reserved×2][0x08][Algorithm][reserved×3]
+	resp[12] = 0x00 // auth
+	resp[15] = 0x08 // payload length
+	resp[16] = uint8(authAlg)
+	resp[20] = 0x01 // integrity
+	resp[23] = 0x08
+	resp[24] = uint8(intAlg)
+	resp[28] = 0x02 // confidentiality
+	resp[31] = 0x08
+	resp[32] = uint8(cryptAlg)
 
 	return resp, nil
 }
